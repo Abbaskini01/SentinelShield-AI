@@ -1,22 +1,24 @@
 import pandas as pd
 import os
 from datetime import datetime
+import ast  # Needed to safely convert string back to tuple
 
 # Define the path for the log file
 LOG_FILE = "activity_log.csv"
-LOG_COLUMNS = ['timestamp', 'prompt', 'action', 'threat_type', 'threat_score', 'reason']
+# Updated columns to include pca_coords
+LOG_COLUMNS = ['timestamp', 'prompt', 'action', 'threat_type', 'threat_score', 'reason', 'pca_coords']
 
-def log_interaction(prompt: str, response_data: dict):
+def log_interaction(prompt: str, response_data: dict, pca_coords: tuple = None):
     """
-    Logs the details of a single user prompt and the system's response to a CSV file.
+    Logs the details of a single user prompt, system response, and PCA coords to a CSV.
 
     Args:
         prompt (str): The raw user input.
-        response_data (dict): The analysis dictionary from the SentinelDefense engine.
+        response_data (dict): The analysis dictionary from the defense engine.
+        pca_coords (tuple, optional): The (x, y) or (x, y, z) coordinates from PCA analysis. Defaults to None.
     """
     # Ensure response_data is a dictionary
     if not isinstance(response_data, dict):
-        # Handle cases where the response might not be as expected
         response_data = {'action': 'error', 'threat_type': 'invalid_response', 'threat_score': 0, 'reason': 'Response was not a valid dictionary.'}
 
     # Prepare the new log entry
@@ -26,7 +28,9 @@ def log_interaction(prompt: str, response_data: dict):
         'action': response_data.get('action', 'unknown'),
         'threat_type': response_data.get('threat_type', 'none'),
         'threat_score': response_data.get('threat_score', 0),
-        'reason': response_data.get('reason', 'No reason provided.')
+        'reason': response_data.get('reason', 'No reason provided.'),
+        # Convert tuple to string for CSV storage, handle None case
+        'pca_coords': str(pca_coords) if pca_coords is not None else 'none'
     }
 
     # Check if the log file already exists to determine if headers are needed
@@ -36,16 +40,17 @@ def log_interaction(prompt: str, response_data: dict):
     df_new_log = pd.DataFrame([log_entry])
 
     # Append to the CSV file. Write header only if the file is new.
-    df_new_log.to_csv(LOG_FILE, mode='a', header=not file_exists, index=False)
+    # Using mode='a' (append) works best.
+    try:
+        df_new_log.to_csv(LOG_FILE, mode='a', header=not file_exists, index=False)
+    except Exception as e:
+        print(f"Error writing to log file: {e}")
+
 
 def get_logs() -> pd.DataFrame:
     """
-    Retrieves all logs from the CSV file and returns them as a sorted DataFrame.
-
-    Returns:
-        pd.DataFrame: A DataFrame containing all log entries, sorted with the
-                      most recent entries first. Returns an empty DataFrame if
-                      the log file does not exist or is empty.
+    Retrieves all logs from the CSV file, converts data types back to usable formats,
+    and returns them as a sorted DataFrame.
     """
     if not os.path.exists(LOG_FILE):
         return pd.DataFrame(columns=LOG_COLUMNS)
@@ -61,49 +66,56 @@ def get_logs() -> pd.DataFrame:
         # Ensure timestamp column is treated as datetime for proper sorting
         df['timestamp'] = pd.to_datetime(df['timestamp'])
 
+        # --- CRITICAL FIX FOR GRAPH ---
+        # Convert the 'pca_coords' string column back into actual Python tuples/lists
+        # We use ast.literal_eval for safe evaluation of the string representation
+        if 'pca_coords' in df.columns:
+            def safe_coords_convert(val):
+                try:
+                    if pd.isna(val) or val == 'none':
+                        return None
+                    return ast.literal_eval(val)
+                except (ValueError, SyntaxError):
+                    return None
+            
+            df['pca_coords'] = df['pca_coords'].apply(safe_coords_convert)
+        # ------------------------------
+
         # Sort the DataFrame by timestamp, newest first
         df = df.sort_values(by='timestamp', ascending=False)
         
+        # Ensure all expected columns exist, even if file was created by older version
+        for col in LOG_COLUMNS:
+             if col not in df.columns:
+                 df[col] = None
+                 
+        # Reorder columns to match defined order
+        df = df[LOG_COLUMNS]
+        
         return df
+
     except pd.errors.EmptyDataError:
-        # This can happen if the file exists but is completely empty
-        return pd.DataFrame(columns=LOG_COLUMNS)
+         return pd.DataFrame(columns=LOG_COLUMNS)
     except Exception as e:
         print(f"An error occurred while reading the log file: {e}")
+        # Return an empty dataframe with correct columns as fallback
         return pd.DataFrame(columns=LOG_COLUMNS)
 
 if __name__ == '__main__':
-    # Example usage for testing the logger
-    print("--- Testing Logger System ---")
-    
-    # Example 1: A blocked interaction
-    blocked_response = {
-        "is_safe": False,
-        "threat_type": "sql_injection",
-        "threat_score": 95,
-        "reason": "Detected a potential SQL injection pattern.",
-        "action": "blocked"
-    }
-    log_interaction("' OR 1=1; --", blocked_response)
-    print("Logged a blocked interaction.")
+    # Quick test to ensure it works
+    print("--- Testing Logger with PCA support ---")
+    if os.path.exists(LOG_FILE): os.remove(LOG_FILE) # Start fresh for test
 
-    # Example 2: An allowed interaction
-    allowed_response = {
-        "is_safe": True,
-        "threat_type": "none",
-        "threat_score": 5,
-        "reason": "Prompt appears to be safe.",
-        "action": "allowed"
-    }
-    log_interaction("What is the capital of France?", allowed_response)
-    print("Logged an allowed interaction.")
+    # Test 1: Blocked with coords
+    log_interaction("test attack", {"action": "blocked", "threat_type": "anomaly", "reason": "test"}, pca_coords=(0.5, -0.2))
     
-    # Retrieve and print logs
-    print("\n--- Current Logs (Newest First) ---")
-    all_logs = get_logs()
-    print(all_logs)
+    # Test 2: Allowed with coords
+    log_interaction("hello world", {"action": "allowed", "threat_type": "none", "reason": "safe"}, pca_coords=(-0.1, 0.05))
 
-    # Clean up the test log file
-    if os.path.exists(LOG_FILE):
-        os.remove(LOG_FILE)
-        print(f"\nCleaned up {LOG_FILE}.")
+    # Test 3: No coords
+    log_interaction("no coords test", {"action": "allowed", "reason": "safe"})
+
+    df = get_logs()
+    print(df[['prompt', 'action', 'pca_coords']].head())
+    print("\nLogger test complete. Check data above.")
+    if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
